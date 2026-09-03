@@ -1,0 +1,31 @@
+name: Star and Fork Discord Notifier
+
+# Trigger the workflow on repository star or fork events
+on:
+  watch:
+    types: [started] # GitHub fires 'watch' with type 'started' when someone stars a repo
+  fork:              # Triggered whenever the repository is forked
+
+jobs:
+  notify:
+    name: Send Discord Notification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Post alert to Discord webhook
+        env:
+          # Securely inject the webhook URL stored in Repository Secrets
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          # Build the message payload depending on the trigger event
+          if [ "${{ github.event_name }}" = "watch" ]; then
+            PAYLOAD="⭐ **${{ github.actor }}** just starred [${{ github.repository }}](https://github.com/${{ github.repository }})!"
+          elif [ "${{ github.event_name }}" = "fork" ]; then
+            PAYLOAD="🍴 **${{ github.actor }}** just forked [${{ github.repository }}](https://github.com/${{ github.repository }})!"
+          fi
+
+          # Send the HTTP POST request to the Discord webhook endpoint
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "{\"content\": \"$PAYLOAD\"}" \
+               "$DISCORD_WEBHOOK"
