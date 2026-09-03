@@ -1,31 +1,42 @@
-name: Star and Fork Discord Notifier
+name: Monitor All Public Repos
 
-# Trigger the workflow on repository star or fork events
 on:
-  watch:
-    types: [started] # GitHub fires 'watch' with type 'started' when someone stars a repo
-  fork:              # Triggered whenever the repository is forked
+  schedule:
+    # Runs every 30 minutes
+    - cron: '*/30 * * * *'
+  # Allows triggering the workflow manually via GitHub Actions UI
+  workflow_dispatch:
+
+# Required permissions to write the updated state back to the repository
+permissions:
+  contents: write
 
 jobs:
-  notify:
-    name: Send Discord Notification
+  track:
+    name: Track Stars and Forks
     runs-on: ubuntu-latest
 
     steps:
-      - name: Post alert to Discord webhook
-        env:
-          # Securely inject the webhook URL stored in Repository Secrets
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          # Build the message payload depending on the trigger event
-          if [ "${{ github.event_name }}" = "watch" ]; then
-            PAYLOAD="⭐ **${{ github.actor }}** just starred [${{ github.repository }}](https://github.com/${{ github.repository }})!"
-          elif [ "${{ github.event_name }}" = "fork" ]; then
-            PAYLOAD="🍴 **${{ github.actor }}** just forked [${{ github.repository }}](https://github.com/${{ github.repository }})!"
-          fi
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-          # Send the HTTP POST request to the Discord webhook endpoint
-          curl -H "Content-Type: application/json" \
-               -X POST \
-               -d "{\"content\": \"$PAYLOAD\"}" \
-               "$DISCORD_WEBHOOK"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run tracker script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_ACTOR: ${{ github.repository_owner }}
+        run: python tracker.py
+
+      - name: Commit updated last_run state
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_run.json
+          # Commit and push only if state changes, skip CI triggers
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update last check state [skip ci]" && git push)
