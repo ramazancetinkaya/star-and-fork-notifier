@@ -2,12 +2,11 @@ name: Hourly GitHub Activity Tracker
 
 on:
   schedule:
-    # Runs at minute 0 every hour
     - cron: '0 * * * *'
-  workflow_dispatch: # Allows manual trigger from the GitHub Actions UI
+  workflow_dispatch:
 
 permissions:
-  contents: write # Needed to commit and push updated last_run.json
+  contents: write
 
 jobs:
   track-activity:
@@ -32,12 +31,13 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_USERNAME: ${{ github.repository_owner }}
+          TZ: "Europe/Istanbul" # Sets runner timezone for local logging & state tracking
         run: python tracker.py
 
       - name: Commit and push state
-        if: always() # Always save execution outcome (success or failed)
+        if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add last_run.json
-          git diff --staged --quiet || (git commit -m "chore: sync last_run.json state [skip ci]" && git push)
+          git diff --staged --quiet || (git commit -m "chore: update tracker state [skip ci]" && git push)
