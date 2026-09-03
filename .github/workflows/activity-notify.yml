@@ -1,42 +1,52 @@
-name: Monitor All Public Repos
+name: Public Activity Discord Notifier
 
 on:
   schedule:
-    # Runs automatically every 30 minutes
-    - cron: '*/30 * * * *'
-  # Allows triggering the workflow manually via GitHub Actions UI
-  workflow_dispatch:
+    - cron: '0 * * * *'  # Runs automatically at minute 0 of every hour
+  workflow_dispatch:      # Allows manual trigger for testing
 
-# Required permissions to commit and push the updated state back to the repository
-permissions:
-  contents: write
+concurrency:
+  group: activity-tracker
+  cancel-in-progress: false
 
 jobs:
-  track:
-    name: Track Stars and Forks
+  track-and-notify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Needed to commit last_run.json back to the repository
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      - name: Run tracker script
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests urllib3
+
+      - name: Run Activity Tracker
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_ACTOR: ${{ github.repository_owner }}
-        run: python tracker.py
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          python tracker.py
 
-      - name: Commit updated last_run state
+      - name: Persist State (last_run.json)
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add last_run.json
-          # Commit and push only if state changes, skipping CI loops
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update last check state [skip ci]" && git push)
+          if git diff --staged --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "chore(state): update last_run.json [skip ci]"
+            git push
+          fi
