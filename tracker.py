@@ -1,325 +1,300 @@
+#!/usr/bin/env python3
 """
-GitHub Public Repository Activity Tracker (Stars & Forks)
-Sends real-time embed notifications to Discord via Webhooks.
+GitHub Public Repositories Star & Fork Activity Tracker.
+Monitors user repositories for new stars and forks and dispatches
+rich Discord notifications with rate-limit and error handling.
 
-Author: Developed by ramazancetinkaya
+Developed by ramazancetinkaya
 """
 
-import json
-import logging
 import os
 import sys
+import json
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Any, Optional
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# --- Configuration & Logging ---
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("tracker")
+logger = logging.getLogger("activity-tracker")
 
 STATE_FILE = "last_run.json"
-MAX_EMBEDS_PER_DISCORD_MSG = 10
-DISCORD_RATE_LIMIT_DELAY = 1.5  # Seconds between batch dispatches
-DEV_FOOTER = "Developed by ramazancetinkaya"
+DISCORD_MAX_EMBEDS_PER_MESSAGE = 10
 
 
-@dataclass
-class ActivityEvent:
-    event_id: str
-    event_type: str  # 'star' or 'fork'
-    actor_login: str
-    actor_url: str
-    actor_avatar: str
-    repo_name: str
-    repo_url: str
-    created_at: datetime
+def load_state() -> Dict[str, Any]:
+    """
+    Load previous execution state from last_run.json.
+    If absent or corrupted, falls back to one hour prior.
+    """
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "last_run_timestamp" in data:
+                    logger.info("Loaded previous state with timestamp: %s", data["last_run_timestamp"])
+                    return data
+        except (json.JSONDecodeError, OSError) as err:
+            logger.warning("Failed to read %s (%s). Rebuilding fresh state.", STATE_FILE, err)
+
+    default_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    logger.info("No valid state found. Defaulting last run to 1 hour ago (%s).", default_time)
+    return {"last_run_timestamp": default_time, "status": "initialized"}
 
 
-def get_http_session() -> requests.Session:
-    """Configures and returns a requests.Session with connection retries."""
-    session = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1.5,
-        status_forcelist=[500, 502, 503, 504],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
+def save_state(status: str, execution_time: datetime, previous_state: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Persist execution timestamp and final status to last_run.json.
+    Retains previous successful timestamp upon failure to prevent event loss.
+    """
+    if status == "failed" and previous_state and "last_run_timestamp" in previous_state:
+        effective_timestamp = previous_state["last_run_timestamp"]
+    else:
+        effective_timestamp = execution_time.isoformat()
 
-
-def load_last_run(filepath: str) -> Optional[datetime]:
-    """Loads the last execution timestamp from JSON. Returns None if uninitialized."""
-    if not os.path.exists(filepath):
-        logger.info(f"State file '{filepath}' not found. Performing initial baseline setup.")
-        return None
+    state_data = {
+        "last_run_timestamp": effective_timestamp,
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
 
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            iso_str = data.get("last_checked_at")
-            if iso_str:
-                return datetime.fromisoformat(iso_str)
-    except Exception as exc:
-        logger.warning(f"Failed to parse '{filepath}': {exc}. Starting fresh baseline.")
-    return None
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, indent=2)
+        logger.info("Execution state saved successfully: %s", state_data)
+    except OSError as err:
+        logger.error("Failed to write state file %s: %s", STATE_FILE, err)
 
 
-def save_last_run(filepath: str, timestamp: datetime) -> None:
-    """Saves the current execution timestamp to JSON."""
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump({"last_checked_at": timestamp.isoformat()}, f, indent=2)
-        logger.info(f"Updated state in '{filepath}' to {timestamp.isoformat()}.")
-    except Exception as exc:
-        logger.error(f"Critical error saving state to '{filepath}': {exc}")
-        sys.exit(1)
-
-
-def get_public_repositories(
-    session: requests.Session, username: str, token: Optional[str]
-) -> List[Dict[str, Any]]:
-    """Fetches all public repositories owned by the specified user."""
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    repos: List[Dict[str, Any]] = []
+def get_public_repositories(username: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
+    """
+    Retrieve all public repositories owned by the target user with pagination.
+    """
+    repos = []
     page = 1
 
     while True:
-        url = f"https://api.github.com/users/{username}/repos"
-        params = {"type": "public", "per_page": 100, "page": page, "sort": "updated"}
+        url = f"https://api.github.com/users/{username}/repos?type=owner&per_page=100&page={page}"
         try:
-            resp = session.get(url, headers=headers, params=params, timeout=20)
-            if resp.status_code == 404:
-                logger.error(f"GitHub user '{username}' does not exist.")
-                return []
-            resp.raise_for_status()
+            res = requests.get(url, headers=headers, timeout=20)
+            if res.status_code == 403:
+                logger.error("GitHub API rate limit exceeded or access forbidden: %s", res.text)
+                raise RuntimeError("GitHub API rate limit hit.")
+            res.raise_for_status()
 
-            batch = resp.json()
+            batch = res.json()
             if not batch:
                 break
 
-            # Keep only source repos directly owned by the target user
             for repo in batch:
-                if not repo.get("fork", False) and repo.get("owner", {}).get("login", "").lower() == username.lower():
+                if not repo.get("private", False):
                     repos.append(repo)
 
-            if len(batch) < 100:
+            if "next" not in res.links:
                 break
             page += 1
-        except requests.RequestException as exc:
-            logger.error(f"Error fetching public repos for '{username}': {exc}")
-            break
+        except requests.RequestException as err:
+            logger.error("Error fetching repository list on page %d: %s", page, err)
+            raise
 
-    logger.info(f"Retrieved {len(repos)} active public repositories.")
+    logger.info("Found %d public repositories for user '%s'.", len(repos), username)
     return repos
 
 
-def fetch_repo_events(
-    session: requests.Session,
-    repo_full_name: str,
-    since: datetime,
-    token: Optional[str],
-) -> List[ActivityEvent]:
-    """Inspects recent repository events for stars (WatchEvent) and forks (ForkEvent)."""
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    url = f"https://api.github.com/repos/{repo_full_name}/events"
-    events: List[ActivityEvent] = []
-
+def get_repo_activity(repo_full_name: str, since_dt: datetime, headers: Dict[str, str]) -> List[Dict[str, Any]]:
+    """
+    Fetch events for a specific repository and extract new WatchEvents (stars) and ForkEvents.
+    """
+    url = f"https://api.github.com/repos/{repo_full_name}/events?per_page=100"
     try:
-        resp = session.get(url, headers=headers, params={"per_page": 30}, timeout=15)
-        if resp.status_code in (404, 403):
-            # 403 might indicate secondary rate limits or restricted permissions
+        res = requests.get(url, headers=headers, timeout=20)
+        if res.status_code in (404, 451):
+            logger.warning("Repository '%s' unavailable (status: %d). Skipping.", repo_full_name, res.status_code)
             return []
-        resp.raise_for_status()
+        if res.status_code == 403:
+            logger.error("GitHub API rate limit exceeded during repo event fetch.")
+            raise RuntimeError("GitHub API rate limit hit.")
+        res.raise_for_status()
 
-        for raw_event in resp.json():
-            event_time_str = raw_event.get("created_at")
-            if not event_time_str:
+        events = res.json()
+        new_activities = []
+
+        for ev in events:
+            ev_type = ev.get("type")
+            if ev_type not in ("WatchEvent", "ForkEvent"):
                 continue
 
-            event_time = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
-            if event_time <= since:
+            created_at_str = ev.get("created_at")
+            if not created_at_str:
                 continue
 
-            event_type = raw_event.get("type")
-            actor = raw_event.get("actor", {})
-            actor_login = actor.get("login", "unknown")
-            actor_url = f"https://github.com/{actor_login}"
-            actor_avatar = actor.get("avatar_url", "")
-            repo_name = raw_event.get("repo", {}).get("name", repo_full_name)
-            repo_url = f"https://github.com/{repo_name}"
+            # Standardize ISO-8601 string to timezone-aware UTC datetime
+            ev_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
 
-            # Star event check
-            if event_type == "WatchEvent" and raw_event.get("payload", {}).get("action") == "started":
-                events.append(
-                    ActivityEvent(
-                        event_id=raw_event["id"],
-                        event_type="star",
-                        actor_login=actor_login,
-                        actor_url=actor_url,
-                        actor_avatar=actor_avatar,
-                        repo_name=repo_name,
-                        repo_url=repo_url,
-                        created_at=event_time,
-                    )
-                )
+            # Stop parsing older events as GitHub events endpoint is sorted newest-first
+            if ev_dt <= since_dt:
+                break
 
-            # Fork event check
-            elif event_type == "ForkEvent":
-                events.append(
-                    ActivityEvent(
-                        event_id=raw_event["id"],
-                        event_type="fork",
-                        actor_login=actor_login,
-                        actor_url=actor_url,
-                        actor_avatar=actor_avatar,
-                        repo_name=repo_name,
-                        repo_url=repo_url,
-                        created_at=event_time,
-                    )
-                )
+            new_activities.append(ev)
 
-    except requests.RequestException as exc:
-        logger.warning(f"Could not read events for '{repo_full_name}': {exc}")
+        return new_activities
 
-    return events
+    except requests.RequestException as err:
+        logger.error("Network error fetching events for '%s': %s", repo_full_name, err)
+        return []
 
 
-def build_discord_embed(event: ActivityEvent) -> Dict[str, Any]:
-    """Generates a Discord embed payload according to event type."""
-    if event.event_type == "star":
+def build_discord_embed(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Transform a GitHub event into a standardized Discord embed card.
+    """
+    ev_type = event.get("type")
+    actor = event.get("actor", {})
+    actor_name = actor.get("login", "Unknown User")
+    actor_url = f"https://github.com/{actor_name}"
+    actor_avatar = actor.get("avatar_url", "")
+
+    repo_info = event.get("repo", {})
+    repo_name = repo_info.get("name", "Unknown Repo")
+    repo_url = f"https://github.com/{repo_name}"
+    timestamp = event.get("created_at", datetime.now(timezone.utc).isoformat())
+
+    if ev_type == "WatchEvent":
+        color = 16766720  # Gold / Yellow
         title = "⭐ New Star Received!"
-        color = 0xF1C40F  # Gold
-        action_text = "starred"
+        description = f"[{actor_name}]({actor_url}) starred [{repo_name}]({repo_url})"
+    elif ev_type == "ForkEvent":
+        color = 5793266  # Blurple
+        title = "🍴 Repository Forked!"
+        forkee = event.get("payload", {}).get("forkee", {})
+        fork_url = forkee.get("html_url", repo_url)
+        description = (
+            f"[{actor_name}]({actor_url}) forked [{repo_name}]({repo_url})\n"
+            f"Fork: [{forkee.get('full_name', 'fork')}]({fork_url})"
+        )
     else:
-        title = "🍴 New Fork Created!"
-        color = 0x3498DB  # Blue
-        action_text = "forked"
+        color = 10070709
+        title = "GitHub Notification"
+        description = f"[{actor_name}]({actor_url}) triggered {ev_type} on [{repo_name}]({repo_url})"
 
-    description = (
-        f"👤 **[{event.actor_login}]({event.actor_url})** has {action_text} "
-        f"📁 **[{event.repo_name}]({event.repo_url})**"
-    )
-
-    embed: Dict[str, Any] = {
+    return {
         "title": title,
         "description": description,
         "color": color,
-        "timestamp": event.created_at.isoformat(),
-        "footer": {"text": DEV_FOOTER},
+        "timestamp": timestamp,
+        "author": {
+            "name": actor_name,
+            "url": actor_url,
+            "icon_url": actor_avatar
+        },
+        "footer": {
+            "text": "Developed by ramazancetinkaya"
+        }
     }
 
-    if event.actor_avatar:
-        embed["thumbnail"] = {"url": event.actor_avatar}
 
-    return embed
+def send_discord_notifications(webhook_url: str, embeds: List[Dict[str, Any]]) -> None:
+    """
+    Send embeds to Discord Webhook in batches of up to 10.
+    Handles HTTP 429 rate limit backoff and prevents spam detection.
+    """
+    total = len(embeds)
+    for i in range(0, total, DISCORD_MAX_EMBEDS_PER_MESSAGE):
+        batch = embeds[i:i + DISCORD_MAX_EMBEDS_PER_MESSAGE]
+        payload = {
+            "username": "GitHub Tracker",
+            "avatar_url": "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+            "embeds": batch
+        }
 
-
-def dispatch_to_discord(
-    session: requests.Session, webhook_url: str, events: List[ActivityEvent]
-) -> None:
-    """Dispatches embed batches to Discord, observing payload caps and rate limits."""
-    if not events:
-        logger.info("No events to send.")
-        return
-
-    # Sort events chronologically
-    events.sort(key=lambda e: e.created_at)
-    embeds = [build_discord_embed(ev) for ev in events]
-
-    # Chunk into batches of up to 10 embeds per payload
-    for i in range(0, len(embeds), MAX_EMBEDS_PER_DISCORD_MSG):
-        chunk = embeds[i : i + MAX_EMBEDS_PER_DISCORD_MSG]
-        payload = {"embeds": chunk}
-
-        dispatched = False
-        max_retries = 3
-
-        while not dispatched and max_retries > 0:
+        sent = False
+        retries = 5
+        while not sent and retries > 0:
             try:
-                resp = session.post(webhook_url, json=payload, timeout=15)
+                res = requests.post(webhook_url, json=payload, timeout=15)
 
-                if resp.status_code == 429:
-                    rate_data = resp.json()
-                    retry_after = rate_data.get("retry_after", 2.0)
-                    logger.warning(f"Discord 429 encountered. Backing off for {retry_after}s.")
+                if res.status_code == 429:
+                    retry_after = res.json().get("retry_after", 2.0)
+                    logger.warning("Discord 429 received. Backing off for %.2f seconds.", retry_after)
                     time.sleep(float(retry_after) + 0.5)
-                    max_retries -= 1
+                    retries -= 1
                     continue
 
-                resp.raise_for_status()
-                dispatched = True
-                logger.info(f"Dispatched batch of {len(chunk)} events to Discord.")
-            except requests.RequestException as exc:
-                logger.error(f"Error sending payload to Discord: {exc}")
-                max_retries -= 1
-                time.sleep(2.0)
+                res.raise_for_status()
+                sent = True
+                logger.info("Dispatched %d embeds to Discord successfully.", len(batch))
 
-        # Respect Discord webhook channel throughput
-        time.sleep(DISCORD_RATE_LIMIT_DELAY)
+            except requests.RequestException as err:
+                retries -= 1
+                logger.error("Failed to deliver webhook batch: %s (%d retries left)", err, retries)
+                if retries <= 0:
+                    raise
+                time.sleep(2)
+
+        # Pause between chunks to avoid flooding Discord gateway
+        if i + DISCORD_MAX_EMBEDS_PER_MESSAGE < total:
+            time.sleep(1.5)
 
 
-def main() -> None:
-    webhook_url = os.getenv("DISCORD_WEBHOOK")
+def main():
+    start_time = datetime.now(timezone.utc)
+    discord_webhook = os.getenv("DISCORD_WEBHOOK")
     github_token = os.getenv("GITHUB_TOKEN")
-    github_user = os.getenv("GITHUB_REPOSITORY_OWNER") or os.getenv("GITHUB_ACTOR")
+    github_user = os.getenv("GITHUB_USERNAME") or os.getenv("GITHUB_REPOSITORY_OWNER")
 
-    if not webhook_url:
-        logger.error("Missing DISCORD_WEBHOOK environment variable.")
+    if not discord_webhook:
+        logger.error("Environment variable DISCORD_WEBHOOK is missing.")
         sys.exit(1)
 
     if not github_user:
-        logger.error("Could not determine GitHub username from environment.")
+        logger.error("GitHub username could not be resolved from environment.")
         sys.exit(1)
 
-    session = get_http_session()
-    current_run_time = datetime.now(timezone.utc)
-    last_run_time = load_last_run(STATE_FILE)
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": f"activity-tracker/{github_user}"
+    }
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
 
-    # First-time initialization safeguard: avoid historical mass-notification
-    if last_run_time is None:
-        save_last_run(STATE_FILE, current_run_time)
-        logger.info("Initialization complete. Tracking starts from next cycle.")
-        return
+    previous_state = load_state()
+    since_dt = datetime.fromisoformat(previous_state["last_run_timestamp"].replace("Z", "+00:00"))
 
-    logger.info(f"Checking events since {last_run_time.isoformat()} for user '{github_user}'.")
-    repos = get_public_repositories(session, github_user, github_token)
+    try:
+        repos = get_public_repositories(github_user, headers)
+        collected_embeds = []
 
-    all_events: List[ActivityEvent] = []
-    seen_ids = set()
+        for repo in repos:
+            repo_name = repo.get("full_name")
+            if not repo_name:
+                continue
 
-    for repo in repos:
-        repo_name = repo["full_name"]
-        events = fetch_repo_events(session, repo_name, last_run_time, github_token)
-        for ev in events:
-            if ev.event_id not in seen_ids:
-                seen_ids.add(ev.event_id)
-                all_events.append(ev)
+            events = get_repo_activity(repo_name, since_dt, headers)
+            for ev in events:
+                embed = build_discord_embed(ev)
+                collected_embeds.append(embed)
 
-    if all_events:
-        logger.info(f"Discovered {len(all_events)} new star/fork event(s). Sending notifications...")
-        dispatch_to_discord(session, webhook_url, all_events)
-    else:
-        logger.info("No new stars or forks detected during this interval.")
+        logger.info("Found a total of %d new star/fork events across all repositories.", len(collected_embeds))
 
-    # Update state only after successful pass
-    save_last_run(STATE_FILE, current_run_time)
+        if collected_embeds:
+            # Sort events chronologically ascending for pleasant chat display
+            collected_embeds.sort(key=lambda x: x["timestamp"])
+            send_discord_notifications(discord_webhook, collected_embeds)
+        else:
+            logger.info("No new activity detected. Notification skipped.")
+
+        save_state(status="success", execution_time=start_time, previous_state=previous_state)
+
+    except Exception as exc:
+        logger.critical("Execution failed unexpectedly: %s", exc, exc_info=True)
+        save_state(status="failed", execution_time=start_time, previous_state=previous_state)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
